@@ -1,18 +1,28 @@
-// Bela iPad timing characterisation rig.
+// RiseTogether Bela forwarder.
 //
-// Measures the latency chain of an iPad running a Flutter LSL app:
-//   T1  motor -> photon      = t_photodiode - t_fsr        (Bela frames only;
-//   gold standard) T2  touch -> OS report   = (touch_clock + theta) - t_fsr T3
-//   OS report -> photon  = t_photodiode - (touch_clock + theta) T4  LSL one-way
-//   = arrival_bela - (sender_ts + time_correction)
+// The Bela is the hardware hub of the experiment. Everything it sees or emits
+// lands on one clock -- the audio frame counter (which bela runs at 48 kHz)
+// -- so a latency between two parties is a frame difference, with no
+// cross-device clock involved and nothing to correct for.
 //
-// theta is the Bela<->iPad LSL clock offset. T4 is confounded by network path
-// asymmetry (time_correction assumes symmetry), so every correction is logged
-// with its uncertainty (~RTT/2), which bounds the error. See docs/.
+//   Raspberry Pi ---trigger--> [ Bela ] ---forwarded verbatim---> EEG amp
+//                                      ---jittered ~1 Hz timer--> EEG amp
+//   iPads (Polly, Pia, ...) ---photodiode---> [ Bela ]
 //
-// Nothing is interpolated or averaged on the device: raw frame<->clock sync
-// pairs and the full time_correction series are logged so the mapping can be
-// fitted, audited and re-fitted offline.
+// The forwarded trigger is a sample-accurate level mirror of the Pi's line,
+// delayed by exactly one block: the PRU writes block k's output word during
+// block k+1. The timer trigger is deliberately jittered -- a metronomic pulse
+// train would beat against the EEG and inject a correlated artefact -- and both
+// its schedule and its RNG seed are logged, so the record stays exact.
+//
+// A device's photodiode edge can be aligned with the final recorded, collated
+// data the ipads record when the photodiode trigger was requested, and then
+// when the Bela log is aligned with the coordinator device logs (which uses LSL
+// to connect to all of the ipads), the entire sequence can be reconstructed
+// referenced to the coordinator's LSL monotonic clock.
+//
+// LSL lives elsewhere in the stack now. The library, the headers and every line
+// of inlet code are kept behind ENABLE_LSL, which is 0.
 
 #include "include/font.h"
 #include <Bela.h>
@@ -43,7 +53,7 @@
 // Compile-time configuration
 // ---------------------------------------------------------------------------
 
-#define ENABLE_LSL 1 // 0 = pins-only mode (replaces render_no_lsl.cpp)
+#define ENABLE_LSL 0 // 0 = pins and triggers only; 1 restores the inlet
 #define USE_OLED_DISPLAY 0
 
 #if ENABLE_LSL
@@ -54,29 +64,53 @@
 static const int kOledI2cDev = 1;
 #endif
 
-// Digital sensor inputs. `active_level` is the logic level that means "the
-// sensor is asserted". `refractory_ms` only drives the `accepted` flag in the
-// log; no edge is ever discarded because of it (see the burst guard in
-// render()). It is a duration, not a frame count, so it means the same thing
-// whatever rate the board comes up at -- gRefractoryFrames[] below holds the
-// conversion, done once in setup() against the real digital sample rate.
-struct SensorPin {
+// Digital inputs. `device` names the physical source -- an iPad for a
+// photodiode, the Pi for the trigger line -- and is what makes a row in
+// edges.csv mean something months later. `active_level` is the logic level that
+// means "asserted". `refractory_ms` only drives the `accepted` flag in the log;
+// no edge is ever discarded because of it (see the burst guard in render()). It
+// is a duration, not a frame count, so it means the same thing whatever rate
+// the board comes up at -- gRefractoryFrames[] below holds the conversion, done
+// once in setup() against the real digital sample rate.
+struct InputPin {
     unsigned int pin;
-    const char* role;
+    const char* role; // "photodiode" | "trigger_in"
+    const char* device;
     bool active_level;
     double refractory_ms;
 };
 
-static const SensorPin kSensorPins[] = {
-    {0, "fsr", true, 1.0},
-    {1, "photodiode", true, 1.0}, // active-HIGH comparator
+// Add a device by adding a row. Two things are indexed by table position rather
+// than by pin number -- the gPinStatesAtomic bitfield and gRefractoryFrames[]
+// -- so there is a hard limit of 16 rows, checked in setup() along with the
+// rest of the map.
+static const InputPin kInputPins[] = {
+    {0, "photodiode", "Polly", true, 1.0}, // active-HIGH comparator
+    {1, "photodiode", "Pia", true, 1.0},
+    {4, "trigger_in", "rpi", true, 0.0}, // no refractory: never mask a trigger
 };
-static const size_t kNumSensorPins =
-    sizeof(kSensorPins) / sizeof(kSensorPins[0]);
+static const size_t kNumInputPins = sizeof(kInputPins) / sizeof(kInputPins[0]);
+static const size_t kMaxInputPins = 16;
 
-// Index into kSensorPins for the live-display pairing. Purely cosmetic.
-static const int kDisplayStartPin = 0; // fsr
-static const int kDisplayEndPin = 1;   // photodiode
+// Which row above carries the Raspberry Pi trigger. setup() checks that this
+// index really does name a "trigger_in" row.
+static const size_t kTriggerInIndex = 2;
+
+// Outputs to the EEG amp. These must not also appear in kInputPins.
+static const unsigned int kFwdOutPin = 12;   // level mirror of the Pi trigger
+static const unsigned int kTimerOutPin = 13; // local jittered trigger
+static const bool kOutIdleLevel = false;     // idle LOW, pulse HIGH
+
+// Timer trigger. Interval = period + U(-jitter, +jitter), scheduled from the
+// previous *scheduled* frame rather than the emitted one, so the mean rate
+// stays exactly 1000/kTimerPeriodMs Hz and quantisation never accumulates.
+static const double kTimerPeriodMs = 1000.0;
+static const double kTimerJitterMs = 200.0;
+static const double kTimerPulseMs = 10.0;
+
+// Both outputs are held idle for this long after the first block: the PRU needs
+// a moment to settle, and the startup pin scan below wants a quiet bus.
+static const double kStartupHoldMs = 250.0;
 
 // If a pin produces more than this many edges inside one refractory window,
 // stop emitting rows for it until it has been stable for a full refractory
@@ -109,11 +143,35 @@ static const size_t kMaxIdLen = 64;
 // the rest of the run, so no synchronisation is needed: setup() completes
 // before render() or any worker thread starts.
 static double gSampleRate = kFallbackFs;
-static uint64_t gRefractoryFrames[16];
+static uint64_t gRefractoryFrames[kMaxInputPins];
 static unsigned int gSyncPeriodBlocks = 1;
+
+// Timer-trigger geometry, resolved the same way against the reported rate.
+static uint64_t gTimerPeriodFrames = 0;
+static uint64_t gTimerJitterFrames = 0;
+static uint64_t gTimerPulseFrames = 0;
+static uint64_t gStartupHoldFrames = 0;
+
+// xorshift32. std::mt19937 allocates and is far too heavy to call from the RT
+// thread; this is three shifts and a modulo. The seed is logged, so a session's
+// entire trigger schedule can be regenerated offline.
+static uint32_t gRngSeed = 0;
+static uint32_t gRngState = 0;
+
+static inline int64_t nextJitterFrames() {
+    gRngState ^= gRngState << 13;
+    gRngState ^= gRngState >> 17;
+    gRngState ^= gRngState << 5;
+    if (gTimerJitterFrames == 0)
+        return 0;
+    const uint32_t span = static_cast<uint32_t>(2 * gTimerJitterFrames + 1);
+    return static_cast<int64_t>(gRngState % span) -
+           static_cast<int64_t>(gTimerJitterFrames);
+}
 
 // Queue depths. Drained every 20 ms by the logger thread.
 static const size_t kEdgeQueueSize = 16384;
+static const size_t kTriggerQueueSize = 4096;
 static const size_t kStatusQueueSize = 1024;
 static const size_t kSyncQueueSize = 1024;
 static const size_t kLslQueueSize = 2048;
@@ -133,13 +191,39 @@ struct EdgeEvent {
     uint64_t dt_frames_prev; // frames since the previous edge on this pin
     uint32_t
         suppressed_count; // edges dropped by the burst guard since last row
-    uint32_t pin_index;   // index into kSensorPins
+    uint32_t pin_index;   // index into kInputPins
     uint8_t state;        // raw logic level
     uint8_t accepted;     // 1 if outside this pin's refractory window
 
     EdgeEvent()
         : frame(0), edge_index(0), dt_frames_prev(0), suppressed_count(0),
           pin_index(0), state(0), accepted(0) {}
+};
+
+// One row per level change on an output pin -- the definitive record of what
+// the EEG amp actually saw, on the same frame axis as every input edge. A timer
+// rising edge carries the jitter drawn for the *next* interval, and how late
+// the pulse was if a dropped block delayed it.
+enum TriggerSource {
+    TRIG_TIMER = 0,
+    TRIG_FORWARD,
+};
+
+static const char* triggerSourceName(uint32_t s) {
+    return s == TRIG_TIMER ? "timer" : "forward";
+}
+
+struct TriggerEvent {
+    uint64_t frame;
+    uint64_t seq;          // per-source counter; rising and falling both
+    int64_t jitter_frames; // signed; timer rising edges only
+    int64_t late_frames;   // > 0 only when a block gap delayed the pulse
+    uint32_t source;
+    uint8_t level;
+
+    TriggerEvent()
+        : frame(0), seq(0), jitter_frames(0), late_frames(0),
+          source(TRIG_TIMER), level(0) {}
 };
 
 enum StatusCode {
@@ -275,6 +359,7 @@ template <typename T, size_t Size> class LockFreeSPSCQueue {
 };
 
 static LockFreeSPSCQueue<EdgeEvent, kEdgeQueueSize> gEdgeQueue;
+static LockFreeSPSCQueue<TriggerEvent, kTriggerQueueSize> gTriggerQueue;
 static LockFreeSPSCQueue<StatusEvent, kStatusQueueSize> gStatusQueueRT;
 static LockFreeSPSCQueue<SyncEvent, kSyncQueueSize> gSyncQueue;
 #if ENABLE_LSL
@@ -440,7 +525,7 @@ struct PinRT {
           suppressed_count(0) {}
 };
 
-static PinRT gPinRT[kNumSensorPins];
+static PinRT gPinRT[kNumInputPins];
 
 // RT-safe status push. No string formatting, no clock call.
 static void pushStatusRT(int code, uint64_t frame, int64_t detail_num) {
@@ -450,6 +535,23 @@ static void pushStatusRT(int code, uint64_t frame, int64_t detail_num) {
     e.lsl_clock = 0.0;
     e.detail_num = detail_num;
     if (!gStatusQueueRT.push(e)) {
+        gDroppedEvents.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// RT-safe trigger push. render() is the sole producer, which is what preserves
+// the queue's single-producer contract.
+static void pushTriggerRT(uint32_t source, uint64_t frame, uint64_t seq,
+                          bool level, int64_t jitter_frames,
+                          int64_t late_frames) {
+    TriggerEvent e;
+    e.source = source;
+    e.frame = frame;
+    e.seq = seq;
+    e.level = level ? 1 : 0;
+    e.jitter_frames = jitter_frames;
+    e.late_frames = late_frames;
+    if (!gTriggerQueue.push(e)) {
         gDroppedEvents.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -472,10 +574,10 @@ void clockSyncTask(void*) {
 // digitalRead() is only meaningful once the audio thread has sampled a block,
 // so this cannot live in setup(); and one block is 16 frames (0.33 ms), which
 // is far too short a window to tell an idle level from a signal, and is also
-// the block most likely to be garbage if the PRU has not settled. Pins 0-11 are
-// the cape's digital inputs; 12-15 are wired to the stereo digital outputs and
-// are unused here, but they are reported too, so a signal on a pin nobody is
-// watching shows up as such instead of looking like a dead sensor.
+// the block most likely to be garbage if the PRU has not settled. Every pin is
+// reported, watched or not, so a signal on a pin nobody is listening to shows
+// up as such instead of looking like a dead sensor -- which is the usual
+// symptom of a pin map that does not match the wiring.
 static const unsigned int kScanFrames = 4800; // 100 ms at 44.1-48 kHz
 
 struct PinScan {
@@ -504,15 +606,21 @@ static void reportDigitalPinScan(BelaContext* context, unsigned int nPins) {
         totalEdges += c.edges;
         totalHigh += c.high_frames;
 
-        const char* role = "(unwatched)";
-        for (size_t p = 0; p < kNumSensorPins; p++) {
-            if (kSensorPins[p].pin == pin) {
-                role = kSensorPins[p].role;
+        char role[48];
+        snprintf(role, sizeof(role), "(unwatched)");
+        for (size_t p = 0; p < kNumInputPins; p++) {
+            if (kInputPins[p].pin == pin) {
+                snprintf(role, sizeof(role), "%s / %s", kInputPins[p].role,
+                         kInputPins[p].device);
                 break;
             }
         }
-        if (pin >= 12 && role[0] == '(')
-            role = "(digital out, unused)";
+        // Our own outputs read back through the same word, so the level shown
+        // for them is what we are driving, not a measurement of anything.
+        if (pin == kFwdOutPin)
+            snprintf(role, sizeof(role), "OUT trigger_fwd (we drive this)");
+        else if (pin == kTimerOutPin)
+            snprintf(role, sizeof(role), "OUT trigger_timer (we drive this)");
 
         rt_printf("%3u  %-5s  %-5s %5u  %5u  %s\n", pin,
                   c.first_state ? "HIGH" : "LOW", c.prev_state ? "HIGH" : "LOW",
@@ -591,8 +699,9 @@ void render(BelaContext* context, void* userData) {
     const uint64_t blockEnd = blockStart + context->audioFrames;
 
     // --- block continuity: a dropped block means digital frames were never
-    // read, so an edge could be missing entirely. Without this you cannot tell
-    // "the iPad never flashed" from "the Bela missed it".
+    // read, so an input edge could be missing entirely and an output pulse
+    // could have gone out late. Without this you cannot tell "the iPad never
+    // flashed" from "the Bela missed it".
     static uint64_t sExpectedFrame = 0;
     static bool sFirstBlock = true;
     static unsigned int sLastUnderrunCount = 0;
@@ -616,14 +725,52 @@ void render(BelaContext* context, void* userData) {
 
     updateDigitalPinScan(context);
 
-    // Re-assert input direction every block. Pins default to INPUT and the
-    // setting persists, so this is normally a no-op -- but it costs a handful
-    // of bit operations and guarantees a stray OUTPUT setting cannot silently
-    // corrupt the readings. Direction lives in bits 0-15, values in bits 16-31,
-    // so this cannot disturb what digitalRead() sees.
-    for (size_t p = 0; p < kNumSensorPins; p++) {
-        pinMode(context, 0, kSensorPins[p].pin, INPUT);
+    // Re-assert pin direction every block. Directions persist, so this is
+    // normally a no-op -- but it costs a handful of bit operations and
+    // guarantees that a stray setting cannot silently corrupt a reading or
+    // leave an output undriven. Direction lives in bits 0-15 and values in bits
+    // 16-31, so this cannot disturb what digitalRead() sees.
+    for (size_t p = 0; p < kNumInputPins; p++) {
+        pinMode(context, 0, kInputPins[p].pin, INPUT);
     }
+    pinMode(context, 0, kFwdOutPin, OUTPUT);
+    pinMode(context, 0, kTimerOutPin, OUTPUT);
+
+    // Output state. Bela's digital word is bidirectional and the PRU refills it
+    // with input readings every block, so an output level does NOT persist by
+    // itself -- it has to be re-driven from frame 0 of every block.
+    // digitalWrite() covers frame n to the end of the block, so writing the
+    // held level at frame 0 and again on each change reproduces the waveform
+    // exactly while touching the word only when something happens.
+    static bool sFwdLevel = kOutIdleLevel;
+    static bool sTimerLevel = kOutIdleLevel;
+    static uint64_t sFwdSeq = 0;
+    static uint64_t sTimerSeq = 0;
+
+    // Both outputs stay idle until the startup hold expires: the PRU's first
+    // blocks are the ones most likely to be garbage, and a garbage transition
+    // forwarded to the EEG amp is an event in the recording that never
+    // happened. Once armed, sNextOnFrame advances by period + jitter from its
+    // own previous value, never from the frame a pulse actually landed on, so
+    // quantisation cannot accumulate.
+    static bool sOutputsArmed = false;
+    static uint64_t sNextOnFrame = 0;
+    static uint64_t sOffFrame = 0;
+
+    if (!sOutputsArmed && blockStart >= gStartupHoldFrames) {
+        sOutputsArmed = true;
+        // Adopt the Pi line's current level rather than waiting for its next
+        // edge, so the mirror is correct from the first armed frame even if the
+        // trigger line happens to be asserted right now.
+        sFwdLevel = gPinRT[kTriggerInIndex].initialised
+                        ? gPinRT[kTriggerInIndex].prev_state
+                        : kOutIdleLevel;
+        sNextOnFrame = blockStart + gTimerPeriodFrames;
+        pushStatusRT(ST_INFO, blockStart, static_cast<int64_t>(sNextOnFrame));
+    }
+
+    digitalWrite(context, 0, kFwdOutPin, sFwdLevel);
+    digitalWrite(context, 0, kTimerOutPin, sTimerLevel);
 
     uint16_t states = gPinStatesAtomic.load(std::memory_order_relaxed);
     bool statesChanged = false;
@@ -631,8 +778,8 @@ void render(BelaContext* context, void* userData) {
     for (unsigned int n = 0; n < context->digitalFrames; n++) {
         const uint64_t frame = blockStart + n;
 
-        for (size_t p = 0; p < kNumSensorPins; p++) {
-            const bool state = digitalRead(context, n, kSensorPins[p].pin);
+        for (size_t p = 0; p < kNumInputPins; p++) {
+            const bool state = digitalRead(context, n, kInputPins[p].pin);
             PinRT& s = gPinRT[p];
 
             if (!s.initialised) {
@@ -661,6 +808,17 @@ void render(BelaContext* context, void* userData) {
             else
                 states &= ~(1 << p);
             statesChanged = true;
+
+            // Forward the Pi's line to the EEG amp first. The mirror is the one
+            // thing in this loop with a hard latency budget, and it must not
+            // sit behind the logging bookkeeping -- nor behind the refractory
+            // guard below, which may decide not to emit a row but must never
+            // decide not to pass a trigger on.
+            if (p == kTriggerInIndex && sOutputsArmed) {
+                sFwdLevel = state;
+                digitalWrite(context, n, kFwdOutPin, sFwdLevel);
+                pushTriggerRT(TRIG_FORWARD, frame, sFwdSeq++, state, 0, 0);
+            }
 
             const bool accepted =
                 (frame - s.last_accepted_frame) >= gRefractoryFrames[p];
@@ -692,6 +850,31 @@ void render(BelaContext* context, void* userData) {
                 s.suppressed_count = 0;
             } else {
                 gDroppedEvents.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        // --- jittered timer trigger.
+        // `>=` rather than `==` so that a dropped block cannot swallow a pulse;
+        // the resulting lateness is logged rather than hidden.
+        if (sOutputsArmed) {
+            if (!sTimerLevel && frame >= sNextOnFrame) {
+                const int64_t late = static_cast<int64_t>(frame - sNextOnFrame);
+                sTimerLevel = true;
+                digitalWrite(context, n, kTimerOutPin, true);
+                sOffFrame = frame + gTimerPulseFrames;
+
+                const int64_t jit = nextJitterFrames();
+                sNextOnFrame += gTimerPeriodFrames + jit;
+                // After a gap long enough to swallow a whole interval, catch up
+                // to the grid rather than firing a burst to make up the count.
+                if (sNextOnFrame <= frame)
+                    sNextOnFrame = frame + gTimerPeriodFrames;
+
+                pushTriggerRT(TRIG_TIMER, frame, sTimerSeq++, true, jit, late);
+            } else if (sTimerLevel && frame >= sOffFrame) {
+                sTimerLevel = false;
+                digitalWrite(context, n, kTimerOutPin, false);
+                pushTriggerRT(TRIG_TIMER, frame, sTimerSeq++, false, 0, 0);
             }
         }
 
@@ -949,36 +1132,52 @@ static void lslThreadFunc() {
 // opened once and flushed on an interval, rather than reopened per write.
 // ---------------------------------------------------------------------------
 
+// Live readout only, maintained by the logger thread. The authoritative
+// pairing is done offline against the CSVs, where a device that never flashed
+// shows up as a gap instead of being silently attributed to the next trigger.
 struct LiveStats {
-    uint64_t trials = 0;
-    double lastT1Ms = -1.0;
+    uint64_t timerPulses = 0; // rising edges only
+    uint64_t fwdPulses = 0;   // rising edges only
+    uint64_t xruns = 0;
+#if ENABLE_LSL
     uint64_t lslSamples = 0;
     double lastOneWayMs = 0.0;
     double lastCorrection = 0.0;
     bool haveCorrection = false;
-    uint64_t xruns = 0;
-    // pending start edge for the display-only pairing
-    bool awaitingEnd = false;
-    uint64_t startFrame = 0;
+#endif
+    bool haveFwd = false;
+    uint64_t lastFwdFrame = 0;
+    uint64_t deviceEdges[kMaxInputPins] = {0};
+    bool awaitingFlash[kMaxInputPins] = {false};
+    double lastLatencyMs[kMaxInputPins];
+
+    LiveStats() {
+        for (size_t i = 0; i < kMaxInputPins; i++)
+            lastLatencyMs[i] = -1.0;
+    }
 };
 
 static LiveStats gStats;
 
-static std::ofstream gEdgeFile, gStatusFile, gSyncFile;
+static std::ofstream gEdgeFile, gTriggerFile, gStatusFile, gSyncFile;
 #if ENABLE_LSL
 static std::ofstream gLslFile, gCorrFile;
 #endif
 
 static bool openLogFiles() {
     gEdgeFile.open(sessionPath("_edges.csv"), std::ios::out | std::ios::trunc);
+    gTriggerFile.open(sessionPath("_triggers.csv"),
+                      std::ios::out | std::ios::trunc);
     gStatusFile.open(sessionPath("_status.csv"),
                      std::ios::out | std::ios::trunc);
     gSyncFile.open(sessionPath("_sync.csv"), std::ios::out | std::ios::trunc);
-    if (!gEdgeFile.is_open() || !gStatusFile.is_open() || !gSyncFile.is_open())
+    if (!gEdgeFile.is_open() || !gTriggerFile.is_open() ||
+        !gStatusFile.is_open() || !gSyncFile.is_open())
         return false;
 
-    gEdgeFile << "frame,pin,role,state,active,dt_frames_prev,accepted,"
+    gEdgeFile << "frame,pin,role,device,state,active,dt_frames_prev,accepted,"
                  "suppressed_count,edge_index\n";
+    gTriggerFile << "frame,source,seq,level,jitter_frames,late_frames\n";
     gStatusFile << "frame,lsl_clock,event,detail_num,detail\n";
     gSyncFile << "frame_req,frame_latest,bracket_frames,lsl_clock,"
                  "monotonic_clock\n";
@@ -1006,6 +1205,8 @@ static bool openLogFiles() {
 static void closeLogFiles() {
     gEdgeFile.flush();
     gEdgeFile.close();
+    gTriggerFile.flush();
+    gTriggerFile.close();
     gStatusFile.flush();
     gStatusFile.close();
     gSyncFile.flush();
@@ -1031,32 +1232,52 @@ static void writeStatusRow(const StatusEvent& e) {
 // Returns true if anything was written.
 static bool drainQueues() {
     bool wrote = false;
+    // Triggers before edges, so that within one drain pass a forwarded trigger
+    // is already the reference for the photodiode edges that followed it.
+    TriggerEvent te;
+    while (gTriggerQueue.pop(te)) {
+        gTriggerFile << te.frame << ',' << triggerSourceName(te.source) << ','
+                     << te.seq << ',' << static_cast<int>(te.level) << ','
+                     << te.jitter_frames << ',' << te.late_frames << '\n';
+        wrote = true;
+
+        if (te.level) {
+            if (te.source == TRIG_TIMER) {
+                gStats.timerPulses++;
+            } else {
+                gStats.fwdPulses++;
+                gStats.haveFwd = true;
+                gStats.lastFwdFrame = te.frame;
+                for (size_t i = 0; i < kNumInputPins; i++) {
+                    gStats.awaitingFlash[i] =
+                        strcmp(kInputPins[i].role, "photodiode") == 0;
+                }
+            }
+        }
+    }
+
     EdgeEvent ee;
     while (gEdgeQueue.pop(ee)) {
-        const SensorPin& sp = kSensorPins[ee.pin_index];
-        const bool active = (ee.state != 0) == sp.active_level;
+        const InputPin& ip = kInputPins[ee.pin_index];
+        const bool active = (ee.state != 0) == ip.active_level;
 
-        gEdgeFile << ee.frame << ',' << sp.pin << ',' << sp.role << ','
-                  << static_cast<int>(ee.state) << ',' << (active ? 1 : 0)
-                  << ',' << ee.dt_frames_prev << ','
+        gEdgeFile << ee.frame << ',' << ip.pin << ',' << ip.role << ','
+                  << csvEscape(ip.device) << ',' << static_cast<int>(ee.state)
+                  << ',' << (active ? 1 : 0) << ',' << ee.dt_frames_prev << ','
                   << static_cast<int>(ee.accepted) << ',' << ee.suppressed_count
                   << ',' << ee.edge_index << '\n';
         wrote = true;
 
-        // Display-only pairing. Analysis pairing happens offline against the
-        // `trial` channel, which is unambiguous even when the FSR
-        // false-triggers.
-        if (ee.accepted && active) {
-            if (static_cast<int>(ee.pin_index) == kDisplayStartPin) {
-                gStats.awaitingEnd = true;
-                gStats.startFrame = ee.frame;
-            } else if (static_cast<int>(ee.pin_index) == kDisplayEndPin &&
-                       gStats.awaitingEnd) {
-                gStats.lastT1Ms =
-                    1000.0 * static_cast<double>(ee.frame - gStats.startFrame) /
+        // Count every accepted flash; time only the first one after each
+        // forwarded trigger, which is the one that measures display latency.
+        if (ee.accepted && active && strcmp(ip.role, "photodiode") == 0) {
+            gStats.deviceEdges[ee.pin_index]++;
+            if (gStats.haveFwd && gStats.awaitingFlash[ee.pin_index]) {
+                gStats.lastLatencyMs[ee.pin_index] =
+                    1000.0 *
+                    static_cast<double>(ee.frame - gStats.lastFwdFrame) /
                     gSampleRate;
-                gStats.trials++;
-                gStats.awaitingEnd = false;
+                gStats.awaitingFlash[ee.pin_index] = false;
             }
         }
     }
@@ -1130,6 +1351,7 @@ static bool drainQueues() {
 
 static void flushLogFiles() {
     gEdgeFile.flush();
+    gTriggerFile.flush();
     gStatusFile.flush();
     gSyncFile.flush();
 #if ENABLE_LSL
@@ -1149,64 +1371,45 @@ static void updateDisplay() {
     char line[32];
     const uint16_t states = gPinStatesAtomic.load(std::memory_order_relaxed);
 
-#if ENABLE_LSL
-    std::string src;
-    {
-        std::lock_guard<std::mutex> lock(gConnectedMutex);
-        src = gConnectedSourceId;
-    }
-    if (src.size() > 10)
-        src = src.substr(src.size() - 10);
-    snprintf(line, sizeof(line), "S: %s",
-             gStreamConnected.load(std::memory_order_relaxed) ? src.c_str()
-                                                              : "--");
-#else
-    snprintf(line, sizeof(line), "S: pins only");
-#endif
+    snprintf(line, sizeof(line), "T:%llu F:%llu",
+             (unsigned long long)gStats.timerPulses,
+             (unsigned long long)gStats.fwdPulses);
     ssd1306_oled_clear_line(1);
     ssd1306_oled_set_XY(0, 1);
     ssd1306_oled_write_line(SSD1306_FONT_NORMAL, line);
 
+    // One character per input, upper-case initial of the device name, '*' while
+    // asserted -- enough to see at a glance that everything is wired up.
     std::string pins = "P:";
-    for (size_t i = 0; i < kNumSensorPins; i++) {
+    for (size_t i = 0; i < kNumInputPins; i++) {
         const bool level = ((states >> i) & 1) != 0;
-        const bool active = level == kSensorPins[i].active_level;
+        const bool active = level == kInputPins[i].active_level;
         pins += ' ';
-        pins += static_cast<char>(toupper(kSensorPins[i].role[0]));
-        pins += ':';
-        pins += active ? 'X' : '-';
+        pins += static_cast<char>(toupper(kInputPins[i].device[0]));
+        pins += active ? '*' : '-';
     }
     ssd1306_oled_clear_line(2);
     ssd1306_oled_set_XY(0, 2);
     ssd1306_oled_write_line(SSD1306_FONT_NORMAL, (char*)pins.c_str());
 
-    if (gStats.lastT1Ms >= 0.0) {
-        snprintf(line, sizeof(line), "T1:%.1fms n=%llu", gStats.lastT1Ms,
-                 (unsigned long long)gStats.trials);
-    } else {
-        snprintf(line, sizeof(line), "T1: --");
+    // One line per photodiode device: last display latency against the most
+    // recent forwarded trigger, and how many flashes it has produced.
+    unsigned int row = 3;
+    for (size_t i = 0; i < kNumInputPins && row <= 5; i++) {
+        if (strcmp(kInputPins[i].role, "photodiode") != 0)
+            continue;
+        if (gStats.lastLatencyMs[i] >= 0.0) {
+            snprintf(line, sizeof(line), "%.5s %.1fms n=%llu",
+                     kInputPins[i].device, gStats.lastLatencyMs[i],
+                     (unsigned long long)gStats.deviceEdges[i]);
+        } else {
+            snprintf(line, sizeof(line), "%.5s --", kInputPins[i].device);
+        }
+        ssd1306_oled_clear_line(row);
+        ssd1306_oled_set_XY(0, row);
+        ssd1306_oled_write_line(SSD1306_FONT_NORMAL, line);
+        row++;
     }
-    ssd1306_oled_clear_line(3);
-    ssd1306_oled_set_XY(0, 3);
-    ssd1306_oled_write_line(SSD1306_FONT_NORMAL, line);
-
-#if ENABLE_LSL
-    snprintf(line, sizeof(line), "L:%llu %.2fms",
-             (unsigned long long)gStats.lslSamples, gStats.lastOneWayMs);
-    ssd1306_oled_clear_line(4);
-    ssd1306_oled_set_XY(0, 4);
-    ssd1306_oled_write_line(SSD1306_FONT_NORMAL, line);
-
-    if (gStats.haveCorrection) {
-        snprintf(line, sizeof(line), "off:%.3fms",
-                 gStats.lastCorrection * 1000.0);
-    } else {
-        snprintf(line, sizeof(line), "off: --");
-    }
-    ssd1306_oled_clear_line(5);
-    ssd1306_oled_set_XY(0, 5);
-    ssd1306_oled_write_line(SSD1306_FONT_NORMAL, line);
-#endif
 
     snprintf(
         line, sizeof(line), "!X:%llu D:%llu", (unsigned long long)gStats.xruns,
@@ -1273,7 +1476,7 @@ static void writeMetaJson(BelaContext* context) {
     f << std::fixed << std::setprecision(9);
     f << "{\n";
     f << "  \"session\": \"" << gStem << "\",\n";
-    f << "  \"schema_version\": 1,\n";
+    f << "  \"schema_version\": 2,\n";
     f << "  \"lsl_enabled\": " << (ENABLE_LSL ? "true" : "false") << ",\n";
 
     // Pins the LSL epoch to wall time. The Bela has no battery-backed RTC, so
@@ -1314,14 +1517,41 @@ static void writeMetaJson(BelaContext* context) {
 #endif
 
     f << "  \"max_edges_per_burst\": " << kMaxEdgesPerBurst << ",\n";
-    f << "  \"sensor_pins\": [\n";
-    for (size_t i = 0; i < kNumSensorPins; i++) {
-        f << "    {\"index\": " << i << ", \"pin\": " << kSensorPins[i].pin
-          << ", \"role\": \"" << kSensorPins[i].role
-          << "\", \"active_level\": " << (kSensorPins[i].active_level ? 1 : 0)
-          << ", \"refractory_ms\": " << kSensorPins[i].refractory_ms
+
+    // The PRU writes block k's output word during block k+1, so every output
+    // edge reaches the pin this many frames after the frame it is logged at.
+    // Constant, and the same on both output pins, so it cancels out of any
+    // comparison between the two -- but not out of a comparison with an input.
+    f << "  \"output_block_delay_frames\": " << context->digitalFrames << ",\n";
+    f << "  \"startup_hold_frames\": " << gStartupHoldFrames << ",\n";
+    f << "  \"timer_period_ms\": " << kTimerPeriodMs << ",\n";
+    f << "  \"timer_jitter_ms\": " << kTimerJitterMs << ",\n";
+    f << "  \"timer_pulse_ms\": " << kTimerPulseMs << ",\n";
+    f << "  \"timer_period_frames\": " << gTimerPeriodFrames << ",\n";
+    f << "  \"timer_jitter_frames\": " << gTimerJitterFrames << ",\n";
+    f << "  \"timer_pulse_frames\": " << gTimerPulseFrames << ",\n";
+    // The whole trigger schedule is reproducible offline from this seed.
+    f << "  \"timer_rng\": \"xorshift32\",\n";
+    f << "  \"timer_rng_seed\": " << gRngSeed << ",\n";
+
+    f << "  \"output_pins\": [\n";
+    f << "    {\"pin\": " << kFwdOutPin << ", \"role\": \"trigger_fwd\""
+      << ", \"mirrors_device\": \"" << kInputPins[kTriggerInIndex].device
+      << "\", \"mirrors_pin\": " << kInputPins[kTriggerInIndex].pin
+      << ", \"idle_level\": " << (kOutIdleLevel ? 1 : 0) << "},\n";
+    f << "    {\"pin\": " << kTimerOutPin << ", \"role\": \"trigger_timer\""
+      << ", \"idle_level\": " << (kOutIdleLevel ? 1 : 0) << "}\n";
+    f << "  ],\n";
+
+    f << "  \"input_pins\": [\n";
+    for (size_t i = 0; i < kNumInputPins; i++) {
+        f << "    {\"index\": " << i << ", \"pin\": " << kInputPins[i].pin
+          << ", \"role\": \"" << kInputPins[i].role << "\", \"device\": \""
+          << kInputPins[i].device
+          << "\", \"active_level\": " << (kInputPins[i].active_level ? 1 : 0)
+          << ", \"refractory_ms\": " << kInputPins[i].refractory_ms
           << ", \"refractory_frames\": " << gRefractoryFrames[i] << "}";
-        if (i + 1 < kNumSensorPins)
+        if (i + 1 < kNumInputPins)
             f << ",";
         f << "\n";
     }
@@ -1329,6 +1559,7 @@ static void writeMetaJson(BelaContext* context) {
 
     f << "  \"files\": {\n";
     f << "    \"edges\": \"" << gStem << "_edges.csv\",\n";
+    f << "    \"triggers\": \"" << gStem << "_triggers.csv\",\n";
     f << "    \"status\": \"" << gStem << "_status.csv\",\n";
     f << "    \"sync\": \"" << gStem << "_sync.csv\"";
 #if ENABLE_LSL
@@ -1360,15 +1591,16 @@ bool setup(BelaContext* context, void* userData) {
               lsl::library_version() / 100, lsl::library_version() % 100,
               lsl::protocol_version(), LIBLSL_COMPILE_HEADER_VERSION);
 #else
-    rt_printf("Pins-only mode (ENABLE_LSL=0)\n");
+    rt_printf("Forwarder mode; LSL compiled out (ENABLE_LSL=0).\n");
 #endif
 
     if (!makeSessionDir())
         return false;
     rt_printf("Session: %s\n", gSessionDir.c_str());
 
-    // Every measurement this program makes comes from a digital edge, so a run
-    // without digital I/O produces an empty edges.csv and nothing says why.
+    // Everything this program does is a digital edge -- read, forwarded or
+    // emitted -- so a run without digital I/O produces empty logs, drives
+    // nothing, and nothing says why.
     // The usual cause is the run line: Bela parses --use-digital with atoi(),
     // so the plausible-looking "--use-digital yes" evaluates to 0 and silently
     // turns the pins off (as does "--digital-channels 0").
@@ -1404,24 +1636,137 @@ bool setup(BelaContext* context, void* userData) {
               gSampleRate, gSyncPeriodBlocks,
               1000.0 * gSyncPeriodBlocks * context->audioFrames / gSampleRate);
 
-    for (size_t i = 0; i < kNumSensorPins; i++) {
-        pinMode(context, 0, kSensorPins[i].pin, INPUT);
-        gRefractoryFrames[i] = static_cast<uint64_t>(
-            kSensorPins[i].refractory_ms * gSampleRate / 1000.0 + 0.5);
-        rt_printf(
-            "  pin %2u  role=%-12s active=%s  refractory=%.3f ms (%llu frames)\n",
-            kSensorPins[i].pin, kSensorPins[i].role,
-            kSensorPins[i].active_level ? "HIGH" : "LOW",
-            kSensorPins[i].refractory_ms,
-            static_cast<unsigned long long>(gRefractoryFrames[i]));
+    // Validate the pin map before anything touches it. A duplicated or
+    // out-of-range pin gives a session that looks fine and is quietly wrong,
+    // which is the worst failure mode there is for a recording rig.
+    if (kNumInputPins > kMaxInputPins) {
+        rt_printf("Error: %zu input pins, but the state bitfield and "
+                  "gRefractoryFrames[] hold at most %zu.\n",
+                  kNumInputPins, kMaxInputPins);
+        return false;
     }
+    if (kTriggerInIndex >= kNumInputPins ||
+        strcmp(kInputPins[kTriggerInIndex].role, "trigger_in") != 0) {
+        rt_printf("Error: kTriggerInIndex (%zu) does not name a trigger_in row "
+                  "in kInputPins.\n",
+                  kTriggerInIndex);
+        return false;
+    }
+    {
+        bool used[kMaxInputPins] = {false};
+        const unsigned int outPins[2] = {kFwdOutPin, kTimerOutPin};
+        const unsigned int nUsable = context->digitalChannels < kMaxInputPins
+                                         ? context->digitalChannels
+                                         : kMaxInputPins;
+        for (size_t i = 0; i < kNumInputPins; i++) {
+            const unsigned int pin = kInputPins[i].pin;
+            if (pin >= nUsable) {
+                rt_printf("Error: input pin %u (%s/%s) is outside the %u "
+                          "digital channels this run has.\n",
+                          pin, kInputPins[i].role, kInputPins[i].device,
+                          nUsable);
+                return false;
+            }
+            if (used[pin]) {
+                rt_printf("Error: pin %u appears more than once in the pin "
+                          "map.\n",
+                          pin);
+                return false;
+            }
+            used[pin] = true;
+        }
+        for (size_t i = 0; i < 2; i++) {
+            if (outPins[i] >= nUsable) {
+                rt_printf("Error: output pin %u is outside the %u digital "
+                          "channels this run has.\n",
+                          outPins[i], nUsable);
+                return false;
+            }
+            if (used[outPins[i]]) {
+                rt_printf("Error: pin %u is both an input and an output.\n",
+                          outPins[i]);
+                return false;
+            }
+            used[outPins[i]] = true;
+        }
+    }
+
+    for (size_t i = 0; i < kNumInputPins; i++) {
+        pinMode(context, 0, kInputPins[i].pin, INPUT);
+        gRefractoryFrames[i] = static_cast<uint64_t>(
+            kInputPins[i].refractory_ms * gSampleRate / 1000.0 + 0.5);
+        rt_printf("  in  pin %2u  %-11s %-8s active=%s  refractory=%.3f ms "
+                  "(%llu frames)\n",
+                  kInputPins[i].pin, kInputPins[i].role, kInputPins[i].device,
+                  kInputPins[i].active_level ? "HIGH" : "LOW",
+                  kInputPins[i].refractory_ms,
+                  static_cast<unsigned long long>(gRefractoryFrames[i]));
+    }
+
+    pinMode(context, 0, kFwdOutPin, OUTPUT);
+    pinMode(context, 0, kTimerOutPin, OUTPUT);
+
+    // Timer geometry, resolved against the rate the board actually reports, the
+    // same way the refractory windows are.
+    gTimerPeriodFrames =
+        static_cast<uint64_t>(kTimerPeriodMs * gSampleRate / 1000.0 + 0.5);
+    gTimerJitterFrames =
+        static_cast<uint64_t>(kTimerJitterMs * gSampleRate / 1000.0 + 0.5);
+    gTimerPulseFrames =
+        static_cast<uint64_t>(kTimerPulseMs * gSampleRate / 1000.0 + 0.5);
+    gStartupHoldFrames =
+        static_cast<uint64_t>(kStartupHoldMs * gSampleRate / 1000.0 + 0.5);
+
+    if (gTimerPulseFrames == 0) {
+        rt_printf("Error: timer pulse of %.3f ms is shorter than one frame at "
+                  "%.0f Hz.\n",
+                  kTimerPulseMs, gSampleRate);
+        return false;
+    }
+    // The shortest interval the jitter can draw must still hold a whole pulse
+    // and a gap after it, or two pulses merge and the EEG records one long
+    // event where there should be two.
+    if (gTimerJitterFrames >= gTimerPeriodFrames ||
+        gTimerPulseFrames >= gTimerPeriodFrames - gTimerJitterFrames) {
+        rt_printf(
+            "Error: a %.1f ms pulse does not fit in the shortest interval "
+            "(%.1f ms = period %.1f - jitter %.1f).\n",
+            kTimerPulseMs, kTimerPeriodMs - kTimerJitterMs, kTimerPeriodMs,
+            kTimerJitterMs);
+        return false;
+    }
+
+    // Seeded from the OS once, then advanced only from render().
+    {
+        std::random_device rd;
+        gRngSeed = static_cast<uint32_t>(rd());
+        if (gRngSeed == 0)
+            gRngSeed = 0x9e3779b9u; // xorshift32 is stuck at zero
+        gRngState = gRngSeed;
+    }
+
+    rt_printf("  out pin %2u  trigger_fwd    mirrors %s (pin %u), one block "
+              "(%u frames) behind\n",
+              kFwdOutPin, kInputPins[kTriggerInIndex].device,
+              kInputPins[kTriggerInIndex].pin, context->digitalFrames);
+    rt_printf(
+        "  out pin %2u  trigger_timer  %.0f ms +/- %.0f ms, %.1f ms pulse "
+        "(%llu +/- %llu, %llu frames)\n",
+        kTimerOutPin, kTimerPeriodMs, kTimerJitterMs, kTimerPulseMs,
+        static_cast<unsigned long long>(gTimerPeriodFrames),
+        static_cast<unsigned long long>(gTimerJitterFrames),
+        static_cast<unsigned long long>(gTimerPulseFrames));
+    rt_printf("  jitter seed %u; outputs idle for the first %.0f ms (%llu "
+              "frames).\n",
+              gRngSeed, kStartupHoldMs,
+              static_cast<unsigned long long>(gStartupHoldFrames));
 
 #if USE_OLED_DISPLAY
     ssd1306_init(kOledI2cDev);
     ssd1306_oled_default_config(64, 128);
     ssd1306_oled_clear_screen();
     ssd1306_oled_set_XY(0, 0);
-    ssd1306_oled_write_line(SSD1306_FONT_NORMAL, (char*)"Bela LSL Timing");
+    ssd1306_oled_write_line(SSD1306_FONT_NORMAL, (char*)"RiseTogether fwd");
 #endif
 
     if (!openLogFiles()) {
@@ -1444,8 +1789,8 @@ bool setup(BelaContext* context, void* userData) {
     gLslThread = std::thread(lslThreadFunc);
 #endif
 
-    rt_printf("Setup complete. %zu sensor pins, %.0f Hz digital.\n",
-              kNumSensorPins, context->digitalSampleRate);
+    rt_printf("Setup complete. %zu inputs, 2 outputs, %.0f Hz digital.\n",
+              kNumInputPins, context->digitalSampleRate);
     return true;
 }
 
