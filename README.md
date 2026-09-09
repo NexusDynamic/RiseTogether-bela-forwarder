@@ -166,30 +166,3 @@ All schemas are fixed-width — no ragged rows.
   means digital frames were never read, so an edge could be missing entirely and
   a timer pulse could have gone out late — which is the difference between "the
   iPad never flashed" and "the Bela missed it".
-
-## Known confounds
-
-- **The comparator threshold and the pixel rise time** give the photodiode edge a
-  fixed bias (a few ms on LCD, ~1 ms on OLED). It is a bias, not jitter, so it is
-  tolerable if measured once and documented.
-- **Pin the iPad's display refresh rate.** A ProMotion iPad ramping 60→120 Hz on
-  touch injects variable latency into every trial.
-- **Fix the photodiode patch position** and record it — scanout is row-by-row, so
-  vertical position costs up to a full refresh period.
-- Mirroring the photodiodes to analog inputs would show the rise directly and
-  remove the threshold guesswork. Digital-only by choice.
-
-## A note on `analysis/`
-
-`analysis/` belongs to the previous incarnation of this repo, a timing rig that
-measured an iPad's input→display→network chain against an FSR and an LSL stream.
-It computes T1–T4 and a clock-offset bracket from a schema that no longer exists
-here: it expects an `fsr` role and `_lsl.csv`, and knows nothing about
-`_triggers.csv`. It is kept for reference and does **not** run against a
-forwarder session.
-
-# Acknowledgements
-
-- [Christian A. Kothe: liblsl](https://github.com/sccn/liblsl) for the LSL library
-- [armlabs: OLED SSD1306 Linux driver](https://github.com/armlabs/ssd1306_linux) for the OLED driver
-- [Liam Donovan <liam@bela.io>: Bela](https://bela.io) for the Bela platform
