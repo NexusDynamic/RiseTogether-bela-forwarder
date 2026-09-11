@@ -85,20 +85,24 @@ struct InputPin {
 // -- so there is a hard limit of 16 rows, checked in setup() along with the
 // rest of the map.
 static const InputPin kInputPins[] = {
-    {0, "photodiode", "Polly", true, 1.0}, // active-HIGH comparator
-    {1, "photodiode", "Pia", true, 1.0},
-    {4, "trigger_in", "rpi", true, 0.0}, // no refractory: never mask a trigger
+    {0, "photodiode", "Pia", true, 1.0}, // active-HIGH comparator
+    {1, "photodiode", "Parsnip", true, 1.0},
+    {2, "photodiode", "Polly", true, 1.0},
+    {3, "photodiode", "Peter", true, 1.0},
+    {4, "photodiode", "Padme", true, 1.0},
+    {5, "photodiode", "Patrick", true, 1.0},
+    {11, "trigger_in", "rpi", true, 0.0}, // no refractory: never mask a trigger
 };
 static const size_t kNumInputPins = sizeof(kInputPins) / sizeof(kInputPins[0]);
 static const size_t kMaxInputPins = 16;
 
 // Which row above carries the Raspberry Pi trigger. setup() checks that this
 // index really does name a "trigger_in" row.
-static const size_t kTriggerInIndex = 2;
+static const size_t kTriggerInIndex = 6;
 
 // Outputs to the EEG amp. These must not also appear in kInputPins.
-static const unsigned int kFwdOutPin = 12;   // level mirror of the Pi trigger
-static const unsigned int kTimerOutPin = 13; // local jittered trigger
+static const unsigned int kTimerOutPin = 12; // local jittered trigger
+static const unsigned int kFwdOutPin = 13;   // level mirror of the Pi trigger
 static const bool kOutIdleLevel = false;     // idle LOW, pulse HIGH
 
 // Timer trigger. Interval = period + U(-jitter, +jitter), scheduled from the
