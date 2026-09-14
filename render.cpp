@@ -110,7 +110,7 @@ static const bool kOutIdleLevel = false;     // idle LOW, pulse HIGH
 // stays exactly 1000/kTimerPeriodMs Hz and quantisation never accumulates.
 static const double kTimerPeriodMs = 1000.0;
 static const double kTimerJitterMs = 200.0;
-static const double kTimerPulseMs = 10.0;
+static const double kTimerPulseMs = 100.0;
 
 // Both outputs are held idle for this long after the first block: the PRU needs
 // a moment to settle, and the startup pin scan below wants a quiet bus.

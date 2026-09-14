@@ -6,7 +6,7 @@
 # --stop-button-pin -1 disables the stop button: with all 16 digital channels
 # wired, a floating stop pin can kill a session mid-experiment.
 # BBB_HOSTNAME="192.168.1.2" ../Bela/scripts/build_project.sh \
-BBB_ADDRESS="root@bela.rt" ../Bela/scripts/build_project.sh \
+BBB_ADDRESS="root@bela.local" ../Bela/scripts/build_project.sh \
   -p RiseTogether-bela-forwarder \
   -c "--analog-channels 0 --digital-channels 16 --audio-input-gain 0 --line-out-level 0 --hp-level 0 --verbose --mute-speaker 1 --use-analog 0 --use-digital 1 --disable-led --stop-button-pin -1 --period 16 --high-performance-mode" \
   --force \
