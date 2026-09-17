@@ -72,6 +72,17 @@ static const int kOledI2cDev = 1;
 // is a duration, not a frame count, so it means the same thing whatever rate
 // the board comes up at -- gRefractoryFrames[] below holds the conversion, done
 // once in setup() against the real digital sample rate.
+//
+// An edge is `accepted` when the pin had been quiet -- no edge of either
+// polarity -- for at least `refractory_ms` before it (meta "accept_rule":
+// "quiet_before"). For a photodiode that makes an accepted rising edge exactly
+// a flash onset. An iPad backlight is PWM-dimmed (~480 Hz on the lab panels,
+// dark gaps under 1 ms), so one 100 ms white square arrives as ~50 pulses; the
+// window has to be longer than that gap and shorter than the shortest dark run
+// the marker channel can produce, a Manchester half-bit of 3 samples at 120 Hz
+// (25 ms, ~17 ms after a frame of display jitter). 10 ms sits between the two.
+// Until 2026-09-17 the window was 1 ms and counted from the last *accepted*
+// edge, which accepted a PWM edge every millisecond of every flash.
 struct InputPin {
     unsigned int pin;
     const char* role; // "photodiode" | "trigger_in"
@@ -85,12 +96,12 @@ struct InputPin {
 // -- so there is a hard limit of 16 rows, checked in setup() along with the
 // rest of the map.
 static const InputPin kInputPins[] = {
-    {0, "photodiode", "Pia", true, 1.0}, // active-HIGH comparator
-    {1, "photodiode", "Parsnip", true, 1.0},
-    {2, "photodiode", "Polly", true, 1.0},
-    {3, "photodiode", "Peter", true, 1.0},
-    {4, "photodiode", "Padme", true, 1.0},
-    {5, "photodiode", "Patrick", true, 1.0},
+    {0, "photodiode", "Pia", true, 10.0}, // active-HIGH comparator
+    {1, "photodiode", "Parsnip", true, 10.0},
+    {2, "photodiode", "Polly", true, 10.0},
+    {3, "photodiode", "Peter", true, 10.0},
+    {4, "photodiode", "Padme", true, 10.0},
+    {5, "photodiode", "Patrick", true, 10.0},
     {11, "trigger_in", "rpi", true, 0.0}, // no refractory: never mask a trigger
 };
 static const size_t kNumInputPins = sizeof(kInputPins) / sizeof(kInputPins[0]);
@@ -116,12 +127,20 @@ static const double kTimerPulseMs = 100.0;
 // a moment to settle, and the startup pin scan below wants a quiet bus.
 static const double kStartupHoldMs = 250.0;
 
-// If a pin produces more than this many edges inside one refractory window,
-// stop emitting rows for it until it has been stable for a full refractory
-// period. Suppressed edges are counted and carried on the next emitted row, so
-// the record stays lossless in aggregate while staying bounded in the worst
-// case.
-static const uint32_t kMaxEdgesPerBurst = 64;
+// If a pin produces more than this many edges without a quiet refractory
+// window between them, stop emitting rows for it until it has been quiet for a
+// full refractory period. Suppressed edges are counted and carried on the next
+// emitted row, so the record stays lossless in aggregate while staying bounded
+// in the worst case.
+//
+// Sized for PWM light, not for chatter: with quiet-before acceptance every PWM
+// edge inside a lit stretch is non-accepted. A 100 ms flash is ~100 edges at
+// 480 Hz, but the 2026-09-16 recording also has lit stretches of 1.2-1.3 s with
+// no 10 ms gap on several pins (~1300 edges), which a smaller limit would have
+// cut from the log. 8192 is ~8.5 s of 480 Hz PWM. The queue is not the
+// constraint: even a pin toggling every sample is 960 edges per 20 ms drain,
+// against 16384 slots.
+static const uint32_t kMaxEdgesPerBurst = 8192;
 
 #if ENABLE_LSL
 static const char* kStreamPrefixFilter = "LSLTest";
@@ -824,8 +843,9 @@ void render(BelaContext* context, void* userData) {
                 pushTriggerRT(TRIG_FORWARD, frame, sFwdSeq++, state, 0, 0);
             }
 
-            const bool accepted =
-                (frame - s.last_accepted_frame) >= gRefractoryFrames[p];
+            // Quiet before: `dt` is the gap since the previous edge of either
+            // polarity on this pin, suppressed or not.
+            const bool accepted = dt >= gRefractoryFrames[p];
             if (accepted) {
                 s.last_accepted_frame = frame;
                 s.burst_count = 0;
@@ -836,6 +856,8 @@ void render(BelaContext* context, void* userData) {
             // Bounded chatter guard: keep counting but stop emitting rows until
             // the pin has been quiet for a full refractory period (which is
             // what makes the next edge `accepted` and resets burst_count).
+            // Rising and falling edges both count, so a PWM-lit flash is ~2
+            // edges per PWM period.
             if (!accepted && s.burst_count > kMaxEdgesPerBurst) {
                 s.suppressed_count++;
                 continue;
@@ -1480,7 +1502,7 @@ static void writeMetaJson(BelaContext* context) {
     f << std::fixed << std::setprecision(9);
     f << "{\n";
     f << "  \"session\": \"" << gStem << "\",\n";
-    f << "  \"schema_version\": 2,\n";
+    f << "  \"schema_version\": 3,\n";
     f << "  \"lsl_enabled\": " << (ENABLE_LSL ? "true" : "false") << ",\n";
 
     // Pins the LSL epoch to wall time. The Bela has no battery-backed RTC, so
@@ -1521,6 +1543,9 @@ static void writeMetaJson(BelaContext* context) {
 #endif
 
     f << "  \"max_edges_per_burst\": " << kMaxEdgesPerBurst << ",\n";
+    // schema 3: `accepted` means "quiet for refractory_ms before this edge".
+    // Schema 2 measured the window from the last accepted edge instead.
+    f << "  \"accept_rule\": \"quiet_before\",\n";
 
     // The PRU writes block k's output word during block k+1, so every output
     // edge reaches the pin this many frames after the frame it is logged at.

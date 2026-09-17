@@ -66,6 +66,17 @@ flag in the log — **no edge is ever discarded**, and the Pi's trigger is
 forwarded before the refractory check is even reached, so a chattering line can
 never cost the EEG a trigger.
 
+An edge is `accepted` when the pin was quiet for at least `refractory_ms` before
+it (`"accept_rule": "quiet_before"` in the meta, from `schema_version` 3). For a
+photodiode, an accepted rising edge is therefore a flash onset. The iPad
+backlights are PWM-dimmed (~480 Hz, sub-millisecond dark gaps), so one flash is
+dozens of edges. The photodiode window is 10 ms: longer than any PWM gap, and
+shorter than the shortest dark run a marker burst can contain (3 samples at
+120 Hz, 25 ms, minus a frame of display jitter). Before 2026-09-17 the window
+was 1 ms, measured from the last accepted edge, so `accepted` fired every
+millisecond through a flash. Offline analysis should rebuild flash envelopes
+from all edges rather than trust the flag in either schema.
+
 Both outputs are held idle for the first 250 ms while the PRU settles and the
 startup pin scan runs.
 
