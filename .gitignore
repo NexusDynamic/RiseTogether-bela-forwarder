@@ -17,3 +17,5 @@ __pycache__/
 
 # cross-compilation scratch (liblsl build tree)
 cross/build/
+
+build/
