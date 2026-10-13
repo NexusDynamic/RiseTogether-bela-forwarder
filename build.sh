@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# The project name below is the directory this deploys into on the board, and
-# it has to match the three absolute paths in -m or the rpath breaks.
-# Bela parses these CLArgs with atoi(), so "--use-digital yes" evaluates to 0 and
-# silently turns the pins off. They take numbers, always.
-# --stop-button-pin -1 disables the stop button: with all 16 digital channels
-# wired, a floating stop pin can kill a session mid-experiment.
 # BBB_HOSTNAME="192.168.1.2" ../Bela/scripts/build_project.sh \
 BBB_ADDRESS="root@bela.local" ../Bela/scripts/build_project.sh \
   -p RiseTogether-bela-forwarder \
